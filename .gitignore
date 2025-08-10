@@ -8,3 +8,4 @@ fw*
 .*
 ErrorLog.csv
 1
+result/

@@ -35,6 +35,13 @@ private:
     double rtssleaf = 1.5;
     vector<vector<double> > QTable;
 
+    // epsilon-greedy 動態控制
+    double epsilon; 
+    const double epsilon_min = 0.05;
+    const double epsilon_max = 1.0;
+    const double epsilon_decay_k = 0.0005; // 衰減速度
+
     void train(const vector<Rule> &rules);
+    void updateEpsilon(int step);
 };
 #endif //HYBRIDTSSV1_2_HYBRIDTSS_H

@@ -100,6 +100,18 @@ size_t HybridTSS::RulesInTable(size_t tableIndex) const {
 }
 
 // -----------------------------------------------------------------------------
+// func name: updateEpsilon
+// description: Epsilon更新公式
+// detail: 根据當前step更新epsilon值，使用指數衰减方式
+// return: 無
+// To-do: 
+// -----------------------------------------------------------------------------
+void HybridTSS::updateEpsilon(int step) {
+    epsilon = epsilon_min + (epsilon_max - epsilon_min) * exp(-epsilon_decay_k * step);
+}
+
+
+// -----------------------------------------------------------------------------
 // func name: getAction
 // description: 根据当前节点的state获取Action
 // detail: state与action编码方式详见readme, epsilion为最优与探索的标记值，epsilion
@@ -108,13 +120,12 @@ size_t HybridTSS::RulesInTable(size_t tableIndex) const {
 // return: {action类型，维度，所选bit(不计算偏移)}
 // To-do: 方法冗余待优化，编码方式待修改，目的支持单个维度多次选取
 // -----------------------------------------------------------------------------
-vector<int> HybridTSS::getAction(SubHybridTSS *state, int epsilion = 100) {
+vector<int> HybridTSS::getAction(SubHybridTSS *state, int epsilion) {
     if (!state) {
         cout << "state node exist" << endl;
         exit(-1);
     }
     
-    // Greedy for linear, TM,
     int s = state->getState();
     vector<Rule> nodeRules = state->getRules();
     if (nodeRules.size() < binth) {
@@ -125,70 +136,53 @@ vector<int> HybridTSS::getAction(SubHybridTSS *state, int epsilion = 100) {
         tupleKey.insert((r.prefix_length[0] << 6) + r.prefix_length[1]);
     }
 
-    // 存疑，待修正
     if (static_cast<double>(nodeRules.size()) <= rtssleaf * static_cast<double>(tupleKey.size())) {
         return {TM, -1, -1};
     }
-    int num = rand() % 100;
+
+    // baseline 模式
     if (epsilion == 100) {
-        // baseline
-        if ((s & 1) == 0) {
-            return {Hash, 0, 7};
-        }
-        if ((s & (1 << 5)) == 0) {
-            return {Hash, 1, 8};
-        }
-        if ((s & (1 << 10)) == 0) {
-            return {Hash, 2, 7};
-        }
-        if ((s & (1 << 15)) == 0) {
-            return {Hash, 3, 7};
-        }
+        if ((s & 1) == 0) return {Hash, 0, 7};
+        if ((s & (1 << 5)) == 0) return {Hash, 1, 8};
+        if ((s & (1 << 10)) == 0) return {Hash, 2, 7};
+        if ((s & (1 << 15)) == 0) return {Hash, 3, 7};
         return {TM, -1, -1};
     }
-    
-    // 记录所有action
-    vector<vector<int> > Actions;
-    // 记录每个action对应的reward， 结构冗余待优化
+
+    // 準備動作和 Q 值
+    vector<vector<int>> Actions;
     vector<double> rews;
-    for (int i = 0; i < 4; i ++) {
-        // 当前维度是否选择过
-        if (s & (1 << (5 * i))) {
-            continue;
-        }
+    for (int i = 0; i < 4; i++) {
+        if (s & (1 << (5 * i))) continue;
         for (int j = 0; j < 16; j++) {
-            if ((i == 2 || i == 3) && j > 7) {
-                continue;
-            }
+            if ((i == 2 || i == 3) && j > 7) continue;
             Actions.push_back({Hash, i, j});
             int act = (i << 4) | j;
             rews.push_back(QTable[s][act]);
         }
     }
-    if (rews.empty()) {
-        return {TM, -1, -1};
-    }
-    if (num <= epsilion) {
-        // E-greedy
-        vector<int> op;
+    if (rews.empty()) return {TM, -1, -1};
+
+    // epsilon-greedy 動態決策
+    double randVal = (double)rand() / RAND_MAX;
+    if (randVal > epsilon) {
+        // exploitation - 選最大 Q 值
+        int bestIdx = 0;
         double maxReward = rews[0];
-        op = Actions[0];
-        for (int i = 0; i < rews.size(); i++) {
+        for (int i = 1; i < (int)rews.size(); i++) {
             if (rews[i] > maxReward) {
                 maxReward = rews[i];
-                op = Actions[i];
+                bestIdx = i;
             }
         }
-        return op;
+        return Actions[bestIdx];
     } else {
-        // random explore
+        // exploration - 隨機
         int N = rand() % rews.size();
         return Actions[N];
     }
-
-
-    return {linear, -1, -1};
 }
+
 
 // -----------------------------------------------------------------------------
 // func name: ConstructBaseline
@@ -260,87 +254,47 @@ string int2str(int x, int len) {
 // To-do: 方法构建HybridTSS方式过于冗余，待优化，训练次数与结束条件待优化
 // -----------------------------------------------------------------------------
 void HybridTSS::train(const vector<Rule> &rules) {
-    const int stateSize = 1 << 20;
-    const int actionSize = 1 << 6;
-    const double learnRate = 0.1;
-    const int maxLoop = 10000;
-    const int reportInterval = maxLoop / 10;
-
+    int stateSize = 1 << 20, actionSize = 1 << 6;
     QTable.resize(stateSize, vector<double>(actionSize, 0.0));
-
-    // 收斂判斷參數
-    const int windowSize = 20;            // 記錄最近 20 次 reward 平均
-    const double stopThreshold = 0.01;    // 若 reward 平均變化低於此值 → 收斂
-    vector<double> recentRewards;
-
+    uint32_t loopNum = 10000;
     int trainRate = 10;
+    epsilon = epsilon_max;
 
-    for (int i = 0; i < maxLoop; i++) {
-        if (i >= reportInterval && i % reportInterval == 0) {
-            std::cout << "Training finish " << trainRate << "% ...............Remaining: " 
-                      << 100 - trainRate << "%" << std::endl;
+    for (int i = 0; i < loopNum; i++) {
+        updateEpsilon(i); // 每次迭代更新 epsilon
+
+        if (i >= loopNum / 10 && i % (loopNum / 10) == 0) {
+            std::cout << "Training finish " << trainRate
+                      << "% ...............Remaining: " << 100 - trainRate << "%" << std::endl;
             trainRate += 10;
         }
 
-        // 1. 建立臨時決策樹
-        auto* tmpRoot = new SubHybridTSS(rules);
+        auto *tmpRoot = new SubHybridTSS(rules);
         queue<SubHybridTSS*> que;
         que.push(tmpRoot);
-
         while (!que.empty()) {
-            SubHybridTSS* node = que.front(); que.pop();
-            vector<int> op = getAction(node, 50);
+            SubHybridTSS* node = que.front();
+            que.pop();
+            vector<int> op = getAction(node, 0); // 使用動態 epsilon
             vector<SubHybridTSS*> children = node->ConstructClassifier(op, "train");
             for (auto iter : children) {
                 if (iter) que.push(iter);
             }
         }
 
-        // 2. 取得 reward 並更新 QTable
         vector<vector<int>> reward = tmpRoot->getReward();
-        double avgReward = 0.0;
-        int count = 0;
-
-        for (auto& iter : reward) {
+        for (auto iter : reward) {
             if ((iter[1] >> 6) != 3) continue;
-            int s = iter[0];
-            int a = iter[1] & ((1 << 6) - 1);
-            int r = iter[2];
-            if (QTable[s][a] == 0) {
-                QTable[s][a] = r;
-            } else {
-                QTable[s][a] += learnRate * (r - QTable[s][a]);
-            }
-            avgReward += r;
-            count++;
+            int s = iter[0], a = iter[1] & ((1 << 6) - 1), r = iter[2];
+            double lr = 0.1;
+            if (QTable[s][a] == 0) QTable[s][a] = r;
+            else QTable[s][a] += lr * (r - QTable[s][a]);
         }
-
-        if (count > 0) avgReward /= count;
-
-        // 3. 滑動平均收斂檢查
-        recentRewards.push_back(avgReward);
-        if (recentRewards.size() > windowSize) recentRewards.erase(recentRewards.begin());
-
-        if (recentRewards.size() == windowSize) {
-            double delta = 0.0;
-            for (size_t j = 1; j < recentRewards.size(); j++) {
-                delta += std::abs(recentRewards[j] - recentRewards[j - 1]);
-            }
-            delta /= (windowSize - 1);
-            if (delta < stopThreshold) {
-                std::cout << "[訓練提早停止] 已收斂於第 " << i << " 回合，平均 reward 變化量 Δ = " 
-                          << delta << std::endl;
-                tmpRoot->recurDelete();
-                delete tmpRoot;
-                break;
-            }
-        }
-
-        // 4. 資源回收
         tmpRoot->recurDelete();
         delete tmpRoot;
     }
 }
+
 
 // -----------------------------------------------------------------------------
 // func name: printInfo
